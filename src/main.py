@@ -196,9 +196,8 @@ def fetch_readme(config: Config, full_name: str) -> str:
 
 
 def summarize_repo(repo: Repo, config: Config) -> Summary:
-    fallback = fallback_summary(repo)
     if not config.ai_api_key:
-        return fallback
+        return fallback_summary(repo, ai_configured=False)
 
     body = {
         "model": config.ai_model,
@@ -239,10 +238,14 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
             timeout=60,
         )
         output = extract_chat_completion_text(response).strip()
-        return parse_ai_summary(output) or fallback
+        summary = parse_ai_summary(output)
+        if summary:
+            return summary
+        print(f"[warn] AI summary returned invalid JSON for {repo.full_name}", file=sys.stderr)
+        return fallback_summary(repo, ai_configured=True)
     except Exception as error:
         print(f"[warn] AI summary failed for {repo.full_name}: {error}", file=sys.stderr)
-        return fallback
+        return fallback_summary(repo, ai_configured=True)
 
 
 def parse_ai_summary(output: str) -> Summary | None:
@@ -369,7 +372,7 @@ def extract_chat_completion_text(response: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def fallback_summary(repo: Repo) -> Summary:
+def fallback_summary(repo: Repo, *, ai_configured: bool) -> Summary:
     readme_intro = extract_intro_line(repo.readme)
     description = clean_inline_text(repo.description)
 
@@ -387,7 +390,9 @@ def fallback_summary(repo: Repo) -> Summary:
         else:
             features = [
                 "README 中未提取到明确功能点。",
-                "建议配置 AI key 以生成更准确的中文功能用途解读。",
+                "已改用规则摘要，建议查看运行日志确认 AI 接口是否调用成功。"
+                if ai_configured
+                else "建议配置 AI key 以生成更准确的中文功能用途解读。",
             ]
     return Summary(intro=intro, features=features[:3])
 
@@ -563,6 +568,7 @@ def publish_server_chan(title: str, content: str, preview: str, send_key: str) -
 
 def main() -> None:
     config = resolve_ai_model(Config.from_env())
+    print_ai_config_status(config)
     selected_names = fetch_trending_repos(config)
     repos: list[Repo] = []
     summaries: dict[str, Summary] = {}
@@ -575,6 +581,14 @@ def main() -> None:
 
     title, content, preview = format_digest(repos, summaries)
     publish(title, content, preview, config)
+
+
+def print_ai_config_status(config: Config) -> None:
+    key_status = "configured" if config.ai_api_key else "missing"
+    print(
+        f"[info] AI config: key={key_status}, base_url={config.ai_base_url}, model={config.ai_model}",
+        file=sys.stderr,
+    )
 
 
 def configure_stdio() -> None:
