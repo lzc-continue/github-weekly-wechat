@@ -53,6 +53,7 @@ Secrets：
 ```text
 SERVER_CHAN_SEND_KEY=你的 Server 酱 SendKey
 AI_API_KEY=你的 AI 服务 API key
+AI_BACKUP_API_KEY=备用 AI 服务 API key，可选
 ```
 
 Variables：
@@ -100,6 +101,35 @@ AI_MODEL=deepseek-chat
 ```
 
 没有配置 AI key 时，脚本会降级为规则摘要，但英文翻译和内容质量会明显差一些。
+
+## AI 保障机制
+
+脚本不会因为 AI key 突然失效就中断当天推送，会按下面顺序处理：
+
+1. 先使用 `AI_API_KEY` 生成中文摘要
+2. 如果主 key 调用失败，自动尝试 `AI_BACKUP_API_KEY`
+3. 如果配置了 `AI_BACKUP_API_KEYS`，会按英文逗号分隔的顺序继续尝试多个备用 key
+4. 如果所有 AI key 都失败，仍会发送规则摘要，并在 GitHub Actions 日志里记录失败原因
+
+建议至少配置一个备用 key：
+
+```text
+AI_BACKUP_API_KEY=你的备用 key
+```
+
+如果你有多个备用 key，可以配置：
+
+```text
+AI_BACKUP_API_KEYS=备用key1,备用key2,备用key3
+```
+
+日志里会看到类似：
+
+```text
+[warn] AI summary failed for owner/repo; key #1: HTTP Error 401: Unauthorized | key #2: ...
+```
+
+这里的 `key #1` 是主 key，`key #2` 开始是备用 key。日志不会打印真实 key。
 
 ## 本地测试
 

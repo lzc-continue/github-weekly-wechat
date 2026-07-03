@@ -25,6 +25,7 @@ DEFAULT_FEATURE_POINT_MAX_CHARS = 90
 class Config:
     github_token: str
     ai_api_key: str
+    ai_backup_api_keys: list[str]
     ai_base_url: str
     ai_model: str
     ai_model_preferences: list[str]
@@ -42,6 +43,12 @@ class Config:
         return cls(
             github_token=os.getenv("GITHUB_TOKEN", "").strip(),
             ai_api_key=(os.getenv("AI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip(),
+            ai_backup_api_keys=parse_list(
+                os.getenv("AI_BACKUP_API_KEYS")
+                or os.getenv("AI_BACKUP_API_KEY")
+                or os.getenv("OPENAI_BACKUP_API_KEY")
+                or ""
+            ),
             ai_base_url=(os.getenv("AI_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "https://api.openai.com/v1").strip(),
             ai_model=(os.getenv("AI_MODEL") or os.getenv("OPENAI_MODEL") or "auto").strip(),
             ai_model_preferences=parse_list(
@@ -210,7 +217,8 @@ def fetch_readme(config: Config, full_name: str) -> str:
 
 
 def summarize_repo(repo: Repo, config: Config) -> Summary:
-    if not config.ai_api_key:
+    api_keys = ai_api_keys(config)
+    if not api_keys:
         return fallback_summary(repo, config, ai_configured=False)
 
     body = {
@@ -246,23 +254,38 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
         "max_tokens": 1100,
     }
 
-    try:
-        response = request_json(
-            chat_completions_url(config.ai_base_url),
-            method="POST",
-            headers={"Authorization": f"Bearer {config.ai_api_key}"},
-            body=body,
-            timeout=60,
-        )
-        output = extract_chat_completion_text(response).strip()
-        summary = parse_ai_summary(output)
-        if summary:
-            return trim_summary(summary, config)
-        print(f"[warn] AI summary returned invalid JSON for {repo.full_name}", file=sys.stderr)
-        return fallback_summary(repo, config, ai_configured=True)
-    except Exception as error:
-        print(f"[warn] AI summary failed for {repo.full_name}: {error}", file=sys.stderr)
-        return fallback_summary(repo, config, ai_configured=True)
+    failures: list[str] = []
+    for key_index, api_key in enumerate(api_keys, start=1):
+        try:
+            response = request_json(
+                chat_completions_url(config.ai_base_url),
+                method="POST",
+                headers={"Authorization": f"Bearer {api_key}"},
+                body=body,
+                timeout=60,
+            )
+            output = extract_chat_completion_text(response).strip()
+            summary = parse_ai_summary(output)
+            if summary:
+                if key_index > 1:
+                    print(f"[info] AI summary succeeded for {repo.full_name} with backup key #{key_index}", file=sys.stderr)
+                return trim_summary(summary, config)
+            failures.append(f"key #{key_index}: invalid JSON content")
+        except Exception as error:
+            failures.append(f"key #{key_index}: {error}")
+
+    print(f"[warn] AI summary failed for {repo.full_name}; " + " | ".join(failures), file=sys.stderr)
+    return fallback_summary(repo, config, ai_configured=True)
+
+
+def ai_api_keys(config: Config) -> list[str]:
+    keys = [config.ai_api_key, *config.ai_backup_api_keys]
+    unique: list[str] = []
+    for key in keys:
+        key = key.strip()
+        if key and key not in unique:
+            unique.append(key)
+    return unique
 
 
 def parse_ai_summary(output: str) -> Summary | None:
@@ -320,12 +343,32 @@ def resolve_ai_model(config: Config) -> Config:
 
 
 def fetch_ai_models(config: Config) -> list[str]:
-    response = request_json(
-        models_url(config.ai_base_url),
-        method="GET",
-        headers={"Authorization": f"Bearer {config.ai_api_key}"},
-        timeout=30,
-    )
+    failures: list[str] = []
+    for key_index, api_key in enumerate(ai_api_keys(config), start=1):
+        try:
+            response = request_json(
+                models_url(config.ai_base_url),
+                method="GET",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=30,
+            )
+        except Exception as error:
+            failures.append(f"key #{key_index}: {error}")
+            continue
+
+        models = parse_ai_models(response)
+        if models:
+            if key_index > 1:
+                print(f"[info] AI model discovery succeeded with backup key #{key_index}", file=sys.stderr)
+            return models
+        failures.append(f"key #{key_index}: no chat-like models returned")
+
+    if failures:
+        raise RuntimeError(" | ".join(failures))
+    return []
+
+
+def parse_ai_models(response: Any) -> list[str]:
     raw_models = response.get("data") if isinstance(response, dict) else response
     if not isinstance(raw_models, list):
         return []
@@ -635,7 +678,8 @@ def main() -> None:
 
 
 def print_ai_config_status(config: Config) -> None:
-    key_status = "configured" if config.ai_api_key else "missing"
+    key_count = len(ai_api_keys(config))
+    key_status = f"{key_count} configured" if key_count else "missing"
     print(
         f"[info] AI config: key={key_status}, base_url={config.ai_base_url}, model={config.ai_model}",
         file=sys.stderr,

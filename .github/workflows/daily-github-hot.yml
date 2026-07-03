@@ -25,6 +25,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AI_API_KEY: ${{ secrets.AI_API_KEY || secrets.OPENAI_API_KEY }}
+          AI_BACKUP_API_KEY: ${{ secrets.AI_BACKUP_API_KEY || secrets.OPENAI_BACKUP_API_KEY }}
+          AI_BACKUP_API_KEYS: ${{ secrets.AI_BACKUP_API_KEYS }}
           AI_BASE_URL: ${{ vars.AI_BASE_URL || 'https://api.openai.com/v1' }}
           AI_MODEL: ${{ vars.AI_MODEL || vars.OPENAI_MODEL || 'auto' }}
           AI_MODEL_PREFERENCES: ${{ vars.AI_MODEL_PREFERENCES || 'gpt-4.1-mini,gpt-4.1,gpt-4o-mini,gpt-4o,deepseek-chat,qwen-plus,qwen-turbo,glm-4-flash,moonshot-v1-8k' }}
