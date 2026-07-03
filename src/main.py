@@ -445,21 +445,24 @@ def truncate(text: str, limit: int) -> str:
 
 def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str, str, str]:
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
-    title = f"GitHub 热门开源项目 {today}"
-    sections = [title, ""]
+    title = f"GitHub 每周热门开源项目 {today}"
+    sections = [f"# {title}", ""]
 
     for index, repo in enumerate(repos, start=1):
         summary = summaries[repo.full_name]
         topics = "、".join((repo.topics or [])[:5]) or "无"
         sections.extend(
             [
-                f"{index:02d}. {repo.full_name}",
-                f"简介：{summary.intro}",
-                "功能与用途：",
+                f"## {index}. {repo.full_name}",
+                "",
+                f"**简介：** {summary.intro}",
+                "",
+                "**功能与用途：**",
                 *[f"- {feature}" for feature in summary.features[:3]],
-                f"Stars：{repo.stars:,}",
-                f"Topics：{topics}",
-                f"链接：{repo.url}",
+                "",
+                f"**Stars：** {repo.stars:,}",
+                f"**Topics：** {topics}",
+                f"**链接：** {repo.url}",
                 "",
             ]
         )
