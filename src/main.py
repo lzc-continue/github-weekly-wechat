@@ -12,13 +12,11 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
 GITHUB_API = "https://api.github.com"
-USER_AGENT = "github-weekly-wechat/2.0"
+USER_AGENT = "github-weekly-wechat/2.1"
 
 
 @dataclass(frozen=True)
@@ -32,6 +30,7 @@ class Config:
     trending_language: str
     project_limit: int
     readme_chars: int
+    server_chan_preview_chars: int
     dry_run: bool
 
     @classmethod
@@ -49,6 +48,7 @@ class Config:
             trending_language=os.getenv("TRENDING_LANGUAGE", "").strip(),
             project_limit=parse_int("PROJECT_LIMIT", 10, minimum=1, maximum=30),
             readme_chars=parse_int("README_CHARS", 8000, minimum=800, maximum=30000),
+            server_chan_preview_chars=parse_int("SERVER_CHAN_PREVIEW_CHARS", 1800, minimum=200, maximum=4000),
             dry_run=os.getenv("SEND_DRY_RUN", "false").lower() in {"1", "true", "yes", "on"},
         )
 
@@ -62,6 +62,12 @@ class Repo:
     forks: int = 0
     topics: list[str] | None = None
     readme: str = ""
+
+
+@dataclass
+class Summary:
+    intro: str
+    features: list[str]
 
 
 class TrendingParser(HTMLParser):
@@ -191,7 +197,7 @@ def fetch_readme(config: Config, full_name: str) -> str:
         raise
 
 
-def summarize_repo(repo: Repo, config: Config) -> str:
+def summarize_repo(repo: Repo, config: Config) -> Summary:
     fallback = fallback_summary(repo)
     if not config.ai_api_key:
         return fallback
@@ -203,23 +209,24 @@ def summarize_repo(repo: Repo, config: Config) -> str:
                 "role": "system",
                 "content": (
                     "你是一个面向中文开发者的开源项目解读助手。"
-                    "优先依据 README 内容总结项目；README 信息不足时，再参考仓库描述、topics、stars 等元数据。"
+                    "必须用简体中文输出，除项目名、专有名词、URL、命令名外，不要保留英文句子。"
+                    "优先依据 README 内容总结；README 不足时，再参考仓库描述、topics、stars 等元数据。"
                     "不要编造不存在的能力。不要输出使用方法、编程语言或 license。"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "请为下面的 GitHub 热门项目生成微信推送条目。"
-                    "只输出两行，格式必须是：\n"
-                    "介绍：一句话说明项目是什么。\n"
-                    "用途功能：用 2-3 个短句说明它能解决什么问题、主要功能是什么、适合什么场景。\n\n"
-                    f"仓库信息：{json.dumps(repo_payload(repo, config), ensure_ascii=False)}"
+                    "请为下面 GitHub 热门项目生成微信消息内容。"
+                    "只返回 JSON，不要 Markdown，不要代码块。格式："
+                    '{"intro":"一句中文简介，说明项目是什么","features":["中文功能点1","中文功能点2","中文功能点3"]}'
+                    "要求 features 每个点独立成句，最多 3 个，每个不超过 45 个汉字。"
+                    f"\n\n仓库信息：{json.dumps(repo_payload(repo, config), ensure_ascii=False)}"
                 ),
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 500,
+        "max_tokens": 700,
     }
 
     try:
@@ -231,10 +238,30 @@ def summarize_repo(repo: Repo, config: Config) -> str:
             timeout=60,
         )
         output = extract_chat_completion_text(response).strip()
-        return normalize_summary(output) or fallback
+        return parse_ai_summary(output) or fallback
     except Exception as error:
         print(f"[warn] AI summary failed for {repo.full_name}: {error}", file=sys.stderr)
         return fallback
+
+
+def parse_ai_summary(output: str) -> Summary | None:
+    cleaned = output.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    intro = clean_inline_text(str(payload.get("intro") or ""))
+    raw_features = payload.get("features") or []
+    if not isinstance(raw_features, list):
+        raw_features = [str(raw_features)]
+    features = [clean_inline_text(str(item)) for item in raw_features if clean_inline_text(str(item))]
+    if not intro:
+        return None
+    return Summary(intro=intro, features=features[:3] or ["可结合 README 进一步了解项目能力和适用场景。"])
 
 
 def resolve_ai_model(config: Config) -> Config:
@@ -291,13 +318,11 @@ def select_ai_model(models: list[str], preferences: list[str]) -> str:
         match = exact.get(preferred.lower())
         if match:
             return match
-
     for preferred in preferences:
         preferred_lower = preferred.lower()
         for model in models:
             if preferred_lower in model.lower():
                 return model
-
     return models[0]
 
 
@@ -344,40 +369,24 @@ def extract_chat_completion_text(response: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def fallback_summary(repo: Repo) -> str:
-    intro = strip_markdown(repo.description) or first_readme_sentence(repo.readme) or "README 中没有提供清晰的一句话描述。"
-    features = extract_feature_lines(repo.readme)
-    if features:
-        feature_text = "；".join(features[:3])
-    elif repo.topics:
-        feature_text = "项目主题包括：" + "、".join(repo.topics[:5]) + "。可结合 README 进一步判断适用场景。"
+def fallback_summary(repo: Repo) -> Summary:
+    topics = repo.topics or []
+    topic_text = "、".join(topics[:4]) if topics else "开源工具"
+    if looks_mostly_english(repo.description):
+        intro = f"{repo.full_name} 是一个与 {topic_text} 相关的热门开源项目。"
     else:
-        feature_text = "可从项目 README 了解主要能力和适用场景。"
-    return f"介绍：{intro}\n用途功能：{feature_text}"
-
-
-def first_readme_sentence(readme: str) -> str:
-    for raw_line in readme.splitlines():
-        line = strip_markdown(raw_line)
-        if 20 <= len(line) <= 160 and not line.lower().startswith(("http", "badge", "build")):
-            return line
-    return ""
+        intro = clean_inline_text(repo.description) or f"{repo.full_name} 是一个与 {topic_text} 相关的热门开源项目。"
+    features = [
+        f"项目主题集中在 {topic_text}。",
+        "可结合 README 进一步了解项目定位和核心能力。",
+        "建议配置 AI key 以生成更准确的中文功能解读。",
+    ]
+    return Summary(intro=intro, features=features[:3])
 
 
 def extract_feature_lines(readme: str) -> list[str]:
     lines: list[str] = []
     keywords = [
-        "feature",
-        "features",
-        "support",
-        "supports",
-        "fast",
-        "build",
-        "deploy",
-        "manage",
-        "generate",
-        "automate",
-        "agent",
         "功能",
         "特性",
         "支持",
@@ -385,10 +394,18 @@ def extract_feature_lines(readme: str) -> list[str]:
         "自动",
         "部署",
         "管理",
+        "feature",
+        "support",
+        "build",
+        "deploy",
+        "manage",
+        "generate",
+        "automate",
+        "agent",
     ]
     for raw_line in readme.splitlines():
-        line = strip_markdown(raw_line.strip(" -*>\t"))
-        if not line or len(line) < 12 or len(line) > 140:
+        line = clean_inline_text(strip_markdown(raw_line.strip(" -*>\t")))
+        if not line or len(line) < 12 or len(line) > 90 or looks_mostly_english(line):
             continue
         lowered = line.lower()
         if any(keyword in lowered for keyword in keywords):
@@ -398,20 +415,24 @@ def extract_feature_lines(readme: str) -> list[str]:
     return lines
 
 
-def normalize_summary(summary: str) -> str:
-    lines = [line.strip() for line in summary.splitlines() if line.strip()]
-    kept: list[str] = []
-    for line in lines:
-        if line.startswith(("介绍：", "用途功能：")):
-            kept.append(line)
-    if len(kept) >= 2:
-        return "\n".join(kept[:2])
-    return summary.strip()
+def looks_mostly_english(text: str) -> bool:
+    if not text:
+        return False
+    letters = sum(1 for char in text if char.isascii() and char.isalpha())
+    cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    return letters > 20 and letters > cjk * 2
+
+
+def clean_inline_text(text: str) -> str:
+    text = strip_markdown(text)
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace("； ", "；").replace("。 ", "。")
+    return text.strip(" -:\t\r\n")
 
 
 def strip_markdown(text: str) -> str:
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     text = re.sub(r"[`*_#<>|]", "", text)
     return html.unescape(text).strip()
 
@@ -422,28 +443,41 @@ def truncate(text: str, limit: int) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
-def format_digest(repos: list[Repo], summaries: dict[str, str]) -> tuple[str, str]:
+def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str, str, str]:
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
-    title = f"GitHub 每周热门开源项目 {today}"
-    lines = [f"# {title}", "", "以下项目来自 GitHub weekly trending。", ""]
+    title = f"GitHub 热门开源项目 {today}"
+    sections = [title, ""]
 
     for index, repo in enumerate(repos, start=1):
-        topics = ", ".join((repo.topics or [])[:5]) or "无"
-        lines.extend(
+        summary = summaries[repo.full_name]
+        topics = "、".join((repo.topics or [])[:5]) or "无"
+        sections.extend(
             [
-                f"## {index}. {repo.full_name}",
-                summaries[repo.full_name].strip(),
-                "",
-                f"Stars: {repo.stars:,}",
-                f"Topics: {topics}",
-                f"链接: {repo.url}",
+                f"{index:02d}. {repo.full_name}",
+                f"简介：{summary.intro}",
+                "功能与用途：",
+                *[f"- {feature}" for feature in summary.features[:3]],
+                f"Stars：{repo.stars:,}",
+                f"Topics：{topics}",
+                f"链接：{repo.url}",
                 "",
             ]
         )
-    return title, "\n".join(lines).strip()
+
+    content = "\n".join(sections).strip()
+    preview = build_preview(repos, summaries)
+    return title, content, preview
 
 
-def publish(title: str, content: str, config: Config) -> None:
+def build_preview(repos: list[Repo], summaries: dict[str, Summary]) -> str:
+    lines = []
+    for index, repo in enumerate(repos, start=1):
+        summary = summaries[repo.full_name]
+        lines.append(f"{index}. {repo.full_name}：{summary.intro}")
+    return "\n".join(lines)
+
+
+def publish(title: str, content: str, preview: str, config: Config) -> None:
     if config.dry_run:
         print(content)
         return
@@ -453,12 +487,12 @@ def publish(title: str, content: str, config: Config) -> None:
         print(content)
         return
 
-    publish_server_chan(title, content, config.server_chan_send_key)
+    publish_server_chan(title, content, truncate(preview, config.server_chan_preview_chars), config.server_chan_send_key)
 
 
-def publish_server_chan(title: str, content: str, send_key: str) -> None:
+def publish_server_chan(title: str, content: str, preview: str, send_key: str) -> None:
     url = f"https://sctapi.ftqq.com/{urllib.parse.quote(send_key)}.send"
-    data = urllib.parse.urlencode({"title": title, "desp": content}).encode("utf-8")
+    data = urllib.parse.urlencode({"title": title, "desp": content, "short": preview}).encode("utf-8")
     text = request_text(
         url,
         method="POST",
@@ -479,7 +513,7 @@ def main() -> None:
     config = resolve_ai_model(Config.from_env())
     selected_names = fetch_trending_repos(config)
     repos: list[Repo] = []
-    summaries: dict[str, str] = {}
+    summaries: dict[str, Summary] = {}
 
     for full_name in selected_names:
         print(f"[info] Processing {full_name}", file=sys.stderr)
@@ -487,8 +521,8 @@ def main() -> None:
         repos.append(repo)
         summaries[repo.full_name] = summarize_repo(repo, config)
 
-    title, content = format_digest(repos, summaries)
-    publish(title, content, config)
+    title, content, preview = format_digest(repos, summaries)
+    publish(title, content, preview, config)
 
 
 def configure_stdio() -> None:
