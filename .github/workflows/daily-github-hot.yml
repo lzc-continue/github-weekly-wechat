@@ -32,6 +32,8 @@ jobs:
           TRENDING_LANGUAGE: ${{ vars.TRENDING_LANGUAGE }}
           PROJECT_LIMIT: ${{ vars.PROJECT_LIMIT || '10' }}
           README_CHARS: ${{ vars.README_CHARS || '8000' }}
+          FEATURE_POINT_COUNT: ${{ vars.FEATURE_POINT_COUNT || '4' }}
+          FEATURE_POINT_MAX_CHARS: ${{ vars.FEATURE_POINT_MAX_CHARS || '90' }}
           SERVER_CHAN_PREVIEW_CHARS: ${{ vars.SERVER_CHAN_PREVIEW_CHARS || '1800' }}
           SEND_DRY_RUN: ${{ vars.SEND_DRY_RUN || 'false' }}
         run: python src/main.py

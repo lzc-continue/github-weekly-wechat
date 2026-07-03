@@ -17,6 +17,8 @@ from typing import Any
 
 GITHUB_API = "https://api.github.com"
 USER_AGENT = "github-weekly-wechat/2.1"
+DEFAULT_FEATURE_POINT_COUNT = 4
+DEFAULT_FEATURE_POINT_MAX_CHARS = 90
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,8 @@ class Config:
     trending_language: str
     project_limit: int
     readme_chars: int
+    feature_point_count: int
+    feature_point_max_chars: int
     server_chan_preview_chars: int
     dry_run: bool
 
@@ -48,6 +52,12 @@ class Config:
             trending_language=os.getenv("TRENDING_LANGUAGE", "").strip(),
             project_limit=parse_int("PROJECT_LIMIT", 10, minimum=1, maximum=30),
             readme_chars=parse_int("README_CHARS", 8000, minimum=800, maximum=30000),
+            feature_point_count=parse_int(
+                "FEATURE_POINT_COUNT", DEFAULT_FEATURE_POINT_COUNT, minimum=2, maximum=8
+            ),
+            feature_point_max_chars=parse_int(
+                "FEATURE_POINT_MAX_CHARS", DEFAULT_FEATURE_POINT_MAX_CHARS, minimum=45, maximum=160
+            ),
             server_chan_preview_chars=parse_int("SERVER_CHAN_PREVIEW_CHARS", 1800, minimum=200, maximum=4000),
             dry_run=os.getenv("SEND_DRY_RUN", "false").lower() in {"1", "true", "yes", "on"},
         )
@@ -145,7 +155,11 @@ def request_json(
         data = json.dumps(body).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
     text = request_text(url, method=method, headers=req_headers, data=data, timeout=timeout)
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        preview = clean_response_preview(text)
+        raise ValueError(f"Response from {url} was not JSON: {error}. Preview: {preview}") from error
 
 
 def github_headers(config: Config, *, raw: bool = False) -> dict[str, str]:
@@ -197,7 +211,7 @@ def fetch_readme(config: Config, full_name: str) -> str:
 
 def summarize_repo(repo: Repo, config: Config) -> Summary:
     if not config.ai_api_key:
-        return fallback_summary(repo, ai_configured=False)
+        return fallback_summary(repo, config, ai_configured=False)
 
     body = {
         "model": config.ai_model,
@@ -210,7 +224,8 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
                     "必须先从 README 中寻找项目介绍、功能特性、用途场景和目标用户。"
                     "只有 README 为空或没有可用信息时，才根据仓库名、仓库描述、链接等信息谨慎分析总结。"
                     "如果仓库描述或 README 是英文，要先理解后改写成自然中文。"
-                    "不要编造不存在的能力。不要输出使用方法、编程语言或 license。"
+                    "功能与用途要写得具体，不要只堆关键词；每一点都要说明它能做什么、解决什么问题或适合什么场景。"
+                    "不要编造不存在的能力。不要输出安装步骤、使用命令、编程语言或 license。"
                 ),
             },
             {
@@ -218,15 +233,17 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
                 "content": (
                     "请为下面 GitHub 热门项目生成微信消息内容。"
                     "只返回 JSON，不要 Markdown，不要代码块。格式："
-                    '{"intro":"一句中文简介，说明项目是什么","features":["中文功能点1","中文功能点2","中文功能点3"]}'
-                    "要求 intro 和 features 都优先依据 readme_excerpt；features 每个点独立成句，最多 3 个，每个不超过 45 个汉字。"
+                    '{"intro":"一句中文简介，说明项目是什么","features":["详细功能与用途1","详细功能与用途2","详细功能与用途3","详细功能与用途4"]}'
+                    f"要求 intro 和 features 都优先依据 readme_excerpt；features 每个点独立成句，尽量输出 {config.feature_point_count} 个。"
+                    f"每个功能点控制在 {config.feature_point_max_chars} 个汉字以内，内容要包含具体能力、应用场景或解决的问题。"
+                    "不要写成“项目主题集中在...”这类泛泛描述。"
                     "如果 readme_excerpt 没有功能信息，再自行分析项目可能的用途，但要保持谨慎。"
                     f"\n\n仓库信息：{json.dumps(repo_payload(repo, config), ensure_ascii=False)}"
                 ),
             },
         ],
         "temperature": 0.2,
-        "max_tokens": 700,
+        "max_tokens": 1100,
     }
 
     try:
@@ -240,12 +257,12 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
         output = extract_chat_completion_text(response).strip()
         summary = parse_ai_summary(output)
         if summary:
-            return summary
+            return trim_summary(summary, config)
         print(f"[warn] AI summary returned invalid JSON for {repo.full_name}", file=sys.stderr)
-        return fallback_summary(repo, ai_configured=True)
+        return fallback_summary(repo, config, ai_configured=True)
     except Exception as error:
         print(f"[warn] AI summary failed for {repo.full_name}: {error}", file=sys.stderr)
-        return fallback_summary(repo, ai_configured=True)
+        return fallback_summary(repo, config, ai_configured=True)
 
 
 def parse_ai_summary(output: str) -> Summary | None:
@@ -265,12 +282,17 @@ def parse_ai_summary(output: str) -> Summary | None:
     features = [clean_inline_text(str(item)) for item in raw_features if clean_inline_text(str(item))]
     if not intro:
         return None
-    return Summary(intro=intro, features=features[:3] or ["可结合 README 进一步了解项目能力和适用场景。"])
+    return Summary(intro=intro, features=features or ["可结合 README 进一步了解项目能力和适用场景。"])
 
 
 def resolve_ai_model(config: Config) -> Config:
     if not config.ai_api_key:
         return config
+
+    normalized_base_url = normalize_ai_base_url(config.ai_base_url)
+    if normalized_base_url != config.ai_base_url.rstrip("/"):
+        print(f"[info] Normalized AI_BASE_URL to {normalized_base_url}", file=sys.stderr)
+        config = replace(config, ai_base_url=normalized_base_url)
 
     manual_model = config.ai_model and config.ai_model.lower() not in {"auto", "detect"}
     if manual_model:
@@ -348,19 +370,37 @@ def repo_payload(repo: Repo, config: Config) -> dict[str, Any]:
 
 
 def chat_completions_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
+    normalized = normalize_ai_base_url(base_url)
     if normalized.endswith("/chat/completions"):
         return normalized
     return f"{normalized}/chat/completions"
 
 
 def models_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
+    normalized = normalize_ai_base_url(base_url)
     if normalized.endswith("/models"):
         return normalized
     if normalized.endswith("/chat/completions"):
         normalized = normalized[: -len("/chat/completions")]
     return f"{normalized}/models"
+
+
+def normalize_ai_base_url(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.endswith(("/v1", "/models", "/chat/completions")):
+        return normalized
+    parsed = urllib.parse.urlparse(normalized)
+    path = parsed.path.rstrip("/")
+    if path in {"", "/"}:
+        return f"{normalized}/v1"
+    return normalized
+
+
+def clean_response_preview(text: str, limit: int = 160) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if not cleaned:
+        return "<empty response>"
+    return cleaned[:limit]
 
 
 def extract_chat_completion_text(response: dict[str, Any]) -> str:
@@ -372,7 +412,16 @@ def extract_chat_completion_text(response: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def fallback_summary(repo: Repo, *, ai_configured: bool) -> Summary:
+def trim_summary(summary: Summary, config: Config) -> Summary:
+    features = [
+        shorten_sentence(feature, config.feature_point_max_chars)
+        for feature in summary.features
+        if clean_inline_text(feature)
+    ]
+    return Summary(intro=summary.intro, features=features[: config.feature_point_count])
+
+
+def fallback_summary(repo: Repo, config: Config, *, ai_configured: bool) -> Summary:
     readme_intro = extract_intro_line(repo.readme)
     description = clean_inline_text(repo.description)
 
@@ -386,7 +435,9 @@ def fallback_summary(repo: Repo, *, ai_configured: bool) -> Summary:
     features = extract_feature_lines(repo.readme)
     if not features:
         if description and not looks_mostly_english(description):
-            features = [f"围绕项目简介提供相关能力：{shorten_sentence(description, 34)}。"]
+            features = [
+                f"围绕项目简介提供相关能力：{shorten_sentence(description, config.feature_point_max_chars - 18)}。"
+            ]
         else:
             features = [
                 "README 中未提取到明确功能点。",
@@ -394,7 +445,7 @@ def fallback_summary(repo: Repo, *, ai_configured: bool) -> Summary:
                 if ai_configured
                 else "建议配置 AI key 以生成更准确的中文功能用途解读。",
             ]
-    return Summary(intro=intro, features=features[:3])
+    return trim_summary(Summary(intro=intro, features=features), config)
 
 
 def extract_intro_line(readme: str) -> str:
@@ -433,8 +484,8 @@ def extract_feature_lines(readme: str) -> list[str]:
             continue
         lowered = line.lower()
         if any(keyword in lowered for keyword in keywords):
-            lines.append(shorten_sentence(line, 70))
-        if len(lines) >= 5:
+            lines.append(shorten_sentence(line, DEFAULT_FEATURE_POINT_MAX_CHARS))
+        if len(lines) >= DEFAULT_FEATURE_POINT_COUNT + 1:
             break
     return lines
 
@@ -498,7 +549,7 @@ def truncate(text: str, limit: int) -> str:
     return text[:limit] + "\n...[truncated]"
 
 
-def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str, str, str]:
+def format_digest(repos: list[Repo], summaries: dict[str, Summary], config: Config) -> tuple[str, str, str]:
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
     title = f"GitHub 每周热门开源项目 {today}"
     sections: list[str] = []
@@ -512,7 +563,7 @@ def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str
                 f"**简介：** {summary.intro}",
                 "",
                 "**功能与用途：**",
-                *[f"- {feature}" for feature in summary.features[:3]],
+                *[f"- {feature}" for feature in summary.features[: config.feature_point_count]],
                 "",
                 f"**Stars：** {repo.stars:,}",
                 "",
@@ -579,7 +630,7 @@ def main() -> None:
         repos.append(repo)
         summaries[repo.full_name] = summarize_repo(repo, config)
 
-    title, content, preview = format_digest(repos, summaries)
+    title, content, preview = format_digest(repos, summaries, config)
     publish(title, content, preview, config)
 
 
