@@ -60,7 +60,6 @@ class Repo:
     description: str = ""
     stars: int = 0
     forks: int = 0
-    topics: list[str] | None = None
     readme: str = ""
 
 
@@ -178,7 +177,6 @@ def fetch_repo(config: Config, full_name: str) -> Repo:
         description=data.get("description") or "",
         stars=int(data.get("stargazers_count") or 0),
         forks=int(data.get("forks_count") or 0),
-        topics=list(data.get("topics") or []),
     )
     repo.readme = fetch_readme(config, full_name)
     return repo
@@ -210,7 +208,9 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
                 "content": (
                     "你是一个面向中文开发者的开源项目解读助手。"
                     "必须用简体中文输出，除项目名、专有名词、URL、命令名外，不要保留英文句子。"
-                    "优先依据 README 内容总结；README 不足时，再参考仓库描述、topics、stars 等元数据。"
+                    "必须先从 README 中寻找项目介绍、功能特性、用途场景和目标用户。"
+                    "只有 README 为空或没有可用信息时，才根据仓库名、仓库描述、链接等信息谨慎分析总结。"
+                    "如果仓库描述或 README 是英文，要先理解后改写成自然中文。"
                     "不要编造不存在的能力。不要输出使用方法、编程语言或 license。"
                 ),
             },
@@ -220,7 +220,8 @@ def summarize_repo(repo: Repo, config: Config) -> Summary:
                     "请为下面 GitHub 热门项目生成微信消息内容。"
                     "只返回 JSON，不要 Markdown，不要代码块。格式："
                     '{"intro":"一句中文简介，说明项目是什么","features":["中文功能点1","中文功能点2","中文功能点3"]}'
-                    "要求 features 每个点独立成句，最多 3 个，每个不超过 45 个汉字。"
+                    "要求 intro 和 features 都优先依据 readme_excerpt；features 每个点独立成句，最多 3 个，每个不超过 45 个汉字。"
+                    "如果 readme_excerpt 没有功能信息，再自行分析项目可能的用途，但要保持谨慎。"
                     f"\n\n仓库信息：{json.dumps(repo_payload(repo, config), ensure_ascii=False)}"
                 ),
             },
@@ -338,7 +339,6 @@ def repo_payload(repo: Repo, config: Config) -> dict[str, Any]:
         "description": repo.description,
         "stars": repo.stars,
         "forks": repo.forks,
-        "topics": repo.topics or [],
         "url": repo.url,
         "readme_excerpt": truncate(repo.readme, config.readme_chars),
     }
@@ -370,18 +370,37 @@ def extract_chat_completion_text(response: dict[str, Any]) -> str:
 
 
 def fallback_summary(repo: Repo) -> Summary:
-    topics = repo.topics or []
-    topic_text = "、".join(topics[:4]) if topics else "开源工具"
-    if looks_mostly_english(repo.description):
-        intro = f"{repo.full_name} 是一个与 {topic_text} 相关的热门开源项目。"
+    readme_intro = extract_intro_line(repo.readme)
+    description = clean_inline_text(repo.description)
+
+    if readme_intro:
+        intro = readme_intro
+    elif description and not looks_mostly_english(description):
+        intro = description
     else:
-        intro = clean_inline_text(repo.description) or f"{repo.full_name} 是一个与 {topic_text} 相关的热门开源项目。"
-    features = [
-        f"项目主题集中在 {topic_text}。",
-        "可结合 README 进一步了解项目定位和核心能力。",
-        "建议配置 AI key 以生成更准确的中文功能解读。",
-    ]
+        intro = f"{repo.full_name} 是一个本周受到关注的开源项目。"
+
+    features = extract_feature_lines(repo.readme)
+    if not features:
+        if description and not looks_mostly_english(description):
+            features = [f"围绕项目简介提供相关能力：{shorten_sentence(description, 34)}。"]
+        else:
+            features = [
+                "README 中未提取到明确功能点。",
+                "建议配置 AI key 以生成更准确的中文功能用途解读。",
+            ]
     return Summary(intro=intro, features=features[:3])
+
+
+def extract_intro_line(readme: str) -> str:
+    for raw_line in readme.splitlines():
+        line = clean_inline_text(strip_markdown(raw_line.strip()))
+        if not is_meaningful_readme_line(line):
+            continue
+        if looks_mostly_english(line):
+            continue
+        return shorten_sentence(line, 70)
+    return ""
 
 
 def extract_feature_lines(readme: str) -> list[str]:
@@ -405,14 +424,36 @@ def extract_feature_lines(readme: str) -> list[str]:
     ]
     for raw_line in readme.splitlines():
         line = clean_inline_text(strip_markdown(raw_line.strip(" -*>\t")))
-        if not line or len(line) < 12 or len(line) > 90 or looks_mostly_english(line):
+        if not is_meaningful_readme_line(line) or len(line) > 90 or looks_mostly_english(line):
             continue
         lowered = line.lower()
         if any(keyword in lowered for keyword in keywords):
-            lines.append(line)
+            lines.append(shorten_sentence(line, 70))
         if len(lines) >= 5:
             break
     return lines
+
+
+def is_meaningful_readme_line(line: str) -> bool:
+    if not line or len(line) < 12:
+        return False
+    lowered = line.lower()
+    if not contains_cjk(line):
+        return False
+    if re.fullmatch(r"[\d\s/.,:;|()a-zA-Z-]+", line):
+        return False
+    if lowered.startswith(("http://", "https://", "badge", "npm ", "pip ", "docker ")):
+        return False
+    if any(token in lowered for token in ["shields.io", "github.com/", "img.shields", "license", "stars"]):
+        return False
+    return True
+
+
+def shorten_sentence(text: str, max_chars: int) -> str:
+    text = clean_inline_text(text)
+    if len(text) <= max_chars:
+        return text.rstrip("。；，,;")
+    return text[:max_chars].rstrip("。；，,;") + "..."
 
 
 def looks_mostly_english(text: str) -> bool:
@@ -420,12 +461,21 @@ def looks_mostly_english(text: str) -> bool:
         return False
     letters = sum(1 for char in text if char.isascii() and char.isalpha())
     cjk = sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+    if cjk == 0 and letters > 3:
+        return True
     return letters > 20 and letters > cjk * 2
+
+
+def contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in text)
 
 
 def clean_inline_text(text: str) -> str:
     text = strip_markdown(text)
+    text = text.replace("�", "")
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+\?\s+", " ", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\?(?=\s*[\u4e00-\u9fff])", "", text)
     text = text.replace("； ", "；").replace("。 ", "。")
     return text.strip(" -:\t\r\n")
 
@@ -446,11 +496,10 @@ def truncate(text: str, limit: int) -> str:
 def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str, str, str]:
     today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).strftime("%Y-%m-%d")
     title = f"GitHub 每周热门开源项目 {today}"
-    sections = [f"# {title}", ""]
+    sections: list[str] = []
 
     for index, repo in enumerate(repos, start=1):
         summary = summaries[repo.full_name]
-        topics = "、".join((repo.topics or [])[:5]) or "无"
         sections.extend(
             [
                 f"## {index}. {repo.full_name}",
@@ -461,7 +510,7 @@ def format_digest(repos: list[Repo], summaries: dict[str, Summary]) -> tuple[str
                 *[f"- {feature}" for feature in summary.features[:3]],
                 "",
                 f"**Stars：** {repo.stars:,}",
-                f"**Topics：** {topics}",
+                "",
                 f"**链接：** {repo.url}",
                 "",
             ]
